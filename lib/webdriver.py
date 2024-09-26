@@ -5,6 +5,8 @@ import os
 import re
 import sys
 import time
+import shutil
+import random  # <-- Ensure random is imported
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from selenium import webdriver
@@ -16,7 +18,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     NoSuchElementException,
-    TimeoutException
+    TimeoutException,
+    WebDriverException,
+    InvalidArgumentException  # <-- Ensure InvalidArgumentException is imported
 )
 
 from .log import LOGS_DIRECTORY, get_logger
@@ -31,7 +35,7 @@ LOGIN_URL = BASE_URL + "/api/security/v4/security/token"
 TRIPS_URL = BASE_URL + "/api/mobile-misc/v1/mobile-misc/page/upcoming-trips"
 HEADERS_URL = BASE_URL + "/api/chase/v2/chase/offers"
 
-# Southwest's code when logging in with the incorrect information
+# Southwest's code when logging in with incorrect information
 INVALID_CREDENTIALS_CODE = 400518024
 
 WAIT_TIMEOUT_SECS = 180
@@ -40,21 +44,13 @@ JSON = Dict[str, Any]
 
 logger = get_logger(__name__)
 
-
 class WebDriver:
     """
     Controls fetching valid headers for use with the Southwest API.
 
     This class can be instantiated in two ways:
-    1. Setting/refreshing headers before a check-in to ensure the headers are valid. The
-    check-in URL is requested in the browser. One of the requests from this initial request
-    contains valid headers which are then set for the CheckIn Scheduler.
-
-    2. Logging into an account. In this case, the headers are refreshed and a list of scheduled
-    flights are retrieved.
-
-    Some of this code is based off of:
-    https://github.com/byalextran/southwest-headers/commit/d2969306edb0976290bfa256d41badcc9698f6ed
+    1. Setting/refreshing headers before a check-in to ensure the headers are valid.
+    2. Logging into an account to retrieve reservations and update headers.
     """
 
     def __init__(self, checkin_scheduler: CheckInScheduler) -> None:
@@ -69,69 +65,43 @@ class WebDriver:
 
     def _should_take_screenshots(self) -> bool:
         """
-        Determines if the webdriver should take screenshots for debugging based on the CLI arguments
-        of the script. Similarly to setting verbose logs, this cannot be kept track of easily in a
-        global variable due to the script's use of multiprocessing.
+        Determines if the webdriver should take screenshots for debugging.
         """
         arguments = sys.argv[1:]
         if "--debug-screenshots" in arguments:
             logger.debug("Taking debug screenshots")
             return True
-
         return False
 
     def _take_debug_screenshot(self, driver: webdriver.Chrome, name: str) -> None:
-        """Take a screenshot of the browser and save the image as 'name' in LOGS_DIRECTORY"""
+        """Take a screenshot of the browser and save it."""
         if self.debug_screenshots:
-            driver.save_screenshot(os.path.join(LOGS_DIRECTORY, name))
+            screenshot_path = os.path.join(LOGS_DIRECTORY, name)
+            driver.save_screenshot(screenshot_path)
+            logger.debug(f"Screenshot saved: {screenshot_path}")
 
     def set_headers(self) -> None:
         """
-        The check-in URL is requested. Since another request contains valid headers
-        during the initial request, those headers are set in the CheckIn Scheduler.
+        Initiates the webdriver to navigate to the Southwest home page and captures the necessary headers.
         """
         driver = self._get_driver()
         self._take_debug_screenshot(driver, "pre_headers.png")
-        logger.debug("Waiting for valid headers")
-        # Once this attribute is set, the headers have been set in the checkin_scheduler
-        self._wait_for_attribute("headers_set")
+        logger.debug("Navigating to Southwest home page to capture headers")
+        driver.get(BASE_URL)
+
+        # Allow some time for the page to load and network requests to be made
+        time.sleep(5)
+
+        # Retrieve and parse performance logs to find the headers
+        self._parse_performance_logs(driver)
+
         self._take_debug_screenshot(driver, "post_headers.png")
 
         driver.quit()
 
-    def get_reservations(self, account_monitor: AccountMonitor) -> List[JSON]:
-        """
-        Logs into the account being monitored to retrieve a list of reservations. Since
-        valid headers are produced, they are also grabbed and updated in the check-in scheduler.
-        Last, if the account name is not set, it will be set based on the response information.
-        """
-        driver = self._get_driver()
-        driver.execute_cdp_cmd("Network.responseReceived", self._login_listener)
-
-        logger.debug("Logging into account to get a list of reservations and valid headers")
-
-        # Log in to retrieve the account's reservations and needed headers for later requests
-        self._wait_for_element_not_visible(driver, ".dimmer")
-        self._take_debug_screenshot(driver, "pre_login.png")
-
-        driver.find_element(By.CSS_SELECTOR, ".login-button--box").click()
-        time.sleep(random_sleep_duration(1, 5))
-        driver.find_element(By.CSS_SELECTOR, 'input[name="userNameOrAccountNumber"]').send_keys(account_monitor.username)
-
-        # Use quote_plus to workaround a x-www-form-urlencoded encoding bug on the mobile site
-        driver.find_element(By.CSS_SELECTOR, 'input[name="password"]').send_keys(f"{account_monitor.password}\n")
-
-        # Wait for the necessary information to be set
-        self._wait_for_attribute("headers_set")
-        self._wait_for_login(driver, account_monitor)
-        self._take_debug_screenshot(driver, "post_login.png")
-
-        # The upcoming trips page is also loaded when we log in, so we might as well grab it
-        # instead of requesting again later
-        reservations = self._fetch_reservations(driver)
-
-        driver.quit()
-        return reservations
+        if not self.headers_set:
+            logger.error("Failed to set headers. 'headers_set' attribute not set.")
+            raise DriverTimeoutError("Failed to capture headers within the timeout period.")
 
     def _get_driver(self) -> webdriver.Chrome:
         logger.debug("Starting webdriver for current session")
@@ -146,16 +116,10 @@ class WebDriver:
             chromedriver_path = "/usr/lib/chromium-browser/chromedriver"
             browser_path = "chromium"
 
-        driver_version = "mlatest"
-        if os.environ.get("AUTO_SOUTHWEST_CHECK_IN_DOCKER") == "1":
-            # This environment variable is set in the Docker image. Makes sure a new driver
-            # is not downloaded as the Docker image already has the correct driver
-            driver_version = "keep"
-
         # Configure Chrome options
         options = Options()
         options.binary_location = browser_path
-        options.add_argument("--headless")  # Run headless for non-GUI environments
+        options.add_argument("--headless=new")  # Updated headless flag
         options.add_argument("--disable-gpu")  # Disable GPU acceleration in headless mode
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")  # Overcome limited resource problems
@@ -164,42 +128,197 @@ class WebDriver:
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--disable-infobars")
         options.add_argument("--start-maximized")
+        options.add_argument("--disable-blink-features=AutomationControlled")  # Prevent automation detection
+
+        # Set a realistic User-Agent string
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/116.0.5845.96 Safari/537.36"
+        )
+        options.add_argument(f"user-agent={user_agent}")
+
+        # Additional options to prevent headless detection
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+
+        # Enable Performance Logging via Options
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})  # <-- Set via options
 
         # Initialize Selenium Service
         service = Service(executable_path=chromedriver_path)
 
-        # Initialize Chrome WebDriver
+        # Initialize Chrome WebDriver without desired_capabilities
         try:
             driver = webdriver.Chrome(service=service, options=options)
             logger.debug("Using browser version: %s", driver.capabilities["browserVersion"])
-        except Exception as e:
+
+            # Further prevent detection by modifying navigator properties
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": """
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                        window.navigator.chrome = {
+                            runtime: {},
+                            // etc.
+                        };
+                        Object.defineProperty(navigator, 'plugins', {
+                            get: () => [1, 2, 3, 4, 5],
+                        });
+                        Object.defineProperty(navigator, 'languages', {
+                            get: () => ['en-US', 'en'],
+                        });
+                    """
+                },
+            )
+        except WebDriverException as e:
             logger.error(f"Failed to initialize Chrome WebDriver: {e}")
             raise
 
         logger.debug("Loading Southwest home page (this may take a moment)")
+        return driver
+
+    def _parse_performance_logs(self, driver: webdriver.Chrome) -> None:
+        """
+        Parses the performance logs to find the response for HEADERS_URL and extracts headers.
+        Implements exponential backoff for retries upon encountering 403 or 429 errors.
+        """
+        max_attempts = 5
+        attempt = 0
+
+        while attempt < max_attempts:
+            try:
+                logs = driver.get_log("performance")
+                for entry in logs:
+                    log = json.loads(entry["message"])["message"]
+                    if log["method"] == "Network.requestWillBeSent":
+                        request_url = log["params"]["request"]["url"]
+                        if request_url.startswith(HEADERS_URL):
+                            request_headers = log["params"]["request"]["headers"]
+                            logger.debug(f"Found request for HEADERS_URL: {request_url}")
+                            self.checkin_scheduler.headers = self._get_needed_headers(request_headers)
+                            self.headers_set = True
+                            logger.debug("Headers successfully set from request.")
+                            return  # Exit after finding the required headers
+
+                # If headers not found, check for error responses
+                for entry in logs:
+                    log = json.loads(entry["message"])["message"]
+                    if log["method"] == "Network.responseReceived":
+                        response_url = log["params"]["response"]["url"]
+                        if response_url.startswith(HEADERS_URL):
+                            status_code = log["params"]["response"]["status"]
+                            if status_code in [403, 429]:
+                                raise Exception(f"Encountered HTTP {status_code} while fetching headers.")
+
+                # If headers not found and no errors, wait and retry
+                logger.debug("Headers not found in performance logs. Retrying...")
+                attempt += 1
+                sleep_time = self._calculate_backoff(attempt)
+                logger.debug(f"Sleeping for {sleep_time:.2f} seconds before next attempt.")
+                time.sleep(sleep_time)
+
+            except Exception as e:
+                logger.error(f"Error while parsing performance logs: {e}")
+                if attempt < max_attempts - 1:
+                    sleep_time = self._calculate_backoff(attempt + 1)
+                    logger.debug(f"Sleeping for {sleep_time:.2f} seconds before retrying due to error.")
+                    time.sleep(sleep_time)
+                    attempt += 1
+                else:
+                    if self.debug_screenshots:
+                        self._take_debug_screenshot(driver, "performance_logs_error.png")
+                    raise
+
+        logger.error("Failed to set headers after multiple attempts.")
+        raise DriverTimeoutError("Failed to capture headers after multiple attempts.")
+
+    def _calculate_backoff(self, attempt: int) -> float:
+        """
+        Calculates exponential backoff time with jitter.
+        """
+        base = 60  # Base wait time in seconds (1 minute)
+        cap = 300  # Maximum wait time in seconds (5 minutes)
+        sleep_time = min(cap, base * (2 ** (attempt - 1)))
+        # Add jitter: random between 0.5x to 1.5x
+        sleep_time = sleep_time * random.uniform(0.5, 1.5)
+        return sleep_time
+
+    def get_reservations(self, account_monitor: AccountMonitor) -> List[JSON]:
+        """
+        Logs into the account being monitored to retrieve a list of reservations.
+        """
+        driver = self._get_driver()
+        self._take_debug_screenshot(driver, "pre_login.png")
+        logger.debug("Navigating to Southwest home page for login")
         driver.get(BASE_URL)
-        self._take_debug_screenshot(driver, "after_page_load.png")
+
+        # Allow some time for the page to load
+        time.sleep(5)
 
         # Handle any pop-ups that may appear
         self._handle_popup(driver)
 
-        # Proceed to click the placement link with explicit wait
+        # Take screenshot after handling pop-ups
+        self._take_debug_screenshot(driver, "post_popup.png")
+
+        # Start capturing performance logs
+        driver.get_log("performance")  # Clear existing logs
+
+        logger.debug("Logging into account to get a list of reservations and valid headers")
+
         try:
-            placement_link = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "(//div[@data-qa='placement-link'])[2]"))
-            )
-            placement_link.click()
-            logger.debug("Clicked on the placement link successfully.")
-        except ElementClickInterceptedException:
-            logger.warning("Click intercepted. Attempting to click using JavaScript.")
-            self._click_element_with_js(driver, placement_link)
+            # Click the login button
+            login_button_selector = ".login-button--box"
+            WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, login_button_selector))
+            ).click()
+            logger.debug("Clicked on the login button")
+            time.sleep(random_sleep_duration(1, 3))
+
+            # Enter username
+            username_selector = 'input[name="userNameOrAccountNumber"]'
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, username_selector))
+            ).send_keys(account_monitor.username)
+            logger.debug("Entered username")
+
+            # Enter password
+            password_selector = 'input[name="password"]'
+            password_field = driver.find_element(By.CSS_SELECTOR, password_selector)
+            password_field.send_keys(f"{account_monitor.password}\n")
+            logger.debug("Entered password and submitted login form")
+
+            # Allow time for login to process
+            time.sleep(5)
+
+            # Parse performance logs to capture headers after login
+            self._parse_performance_logs(driver)
+
+            # Handle any post-login pop-ups
+            self._handle_popup(driver)
+
+            # Take screenshot after login
+            self._take_debug_screenshot(driver, "post_login.png")
+
+            # Check if headers have been set
+            if not self.headers_set:
+                logger.error("Failed to set headers after login.")
+                raise DriverTimeoutError("Failed to capture headers after login.")
+
+            # Fetch reservations
+            reservations = self._fetch_reservations(driver)
+            driver.quit()
+            return reservations
+
         except Exception as e:
-            logger.error(f"Failed to click on the placement link: {e}")
-            self._take_debug_screenshot(driver, "click_error.png")
+            logger.error(f"An error occurred during login and reservation retrieval: {e}")
+            self._take_debug_screenshot(driver, "login_error.png")
             driver.quit()
             raise
-
-        return driver
 
     def _handle_popup(self, driver: webdriver.Chrome) -> None:
         """
@@ -233,19 +352,6 @@ class WebDriver:
             driver.quit()
             raise
 
-    def _click_element_with_js(self, driver: webdriver.Chrome, element: webdriver.remote.webelement.WebElement) -> None:
-        """
-        Clicks an element using JavaScript as a fallback.
-        """
-        try:
-            driver.execute_script("arguments[0].click();", element)
-            logger.debug("Clicked on the element using JavaScript.")
-        except Exception as e:
-            logger.error(f"Failed to click on the element using JavaScript: {e}")
-            self._take_debug_screenshot(driver, "js_click_error.png")
-            driver.quit()
-            raise
-
     def is_raspberry_pi(self) -> bool:
         """Detect if the system is a Raspberry Pi by checking /proc/cpuinfo."""
         try:
@@ -255,113 +361,10 @@ class WebDriver:
         except Exception:
             return False
 
-    def _headers_listener(self, data: JSON) -> None:
-        """
-        Wait for the correct URL request has gone through. Once it has, set the headers
-        in the checkin_scheduler.
-        """
-        request = data["params"]["request"]
-        if request["url"] == HEADERS_URL:
-            self.checkin_scheduler.headers = self._get_needed_headers(request["headers"])
-            self.headers_set = True
-
-    def _login_listener(self, data: JSON) -> None:
-        """
-        Wait for various responses that are needed once the account is logged in. The request IDs
-        are kept track of to get the response body associated with them later.
-        """
-        response = data["params"]["response"]
-        if response["url"] == LOGIN_URL:
-            logger.debug("Login response has been received")
-            self.login_request_id = data["params"]["requestId"]
-            self.login_status_code = response["status"]
-        elif response["url"] == TRIPS_URL:
-            logger.debug("Upcoming trips response has been received")
-            self.trips_request_id = data["params"]["requestId"]
-
-    def _wait_for_attribute(self, attribute: str) -> None:
-        logger.debug("Waiting for %s to be set (timeout: %d seconds)", attribute, WAIT_TIMEOUT_SECS)
-        poll_interval = 0.5
-
-        attempts = 0
-        max_attempts = int(WAIT_TIMEOUT_SECS / poll_interval)
-        while not getattr(self, attribute) and attempts < max_attempts:
-            time.sleep(poll_interval)
-            attempts += 1
-
-        if attempts >= max_attempts:
-            timeout_err = DriverTimeoutError(f"Timeout waiting for the '{attribute}' attribute")
-            logger.debug(timeout_err)
-            raise timeout_err
-
-        logger.debug("%s set successfully", attribute)
-
-    def _wait_for_login(self, driver: webdriver.Chrome, account_monitor: AccountMonitor) -> None:
-        """
-        Waits for the login request to go through and sets the account name appropriately.
-        Handles login errors, if necessary.
-        """
-        self._click_login_button(driver)
-        self._wait_for_attribute("login_request_id")
-        login_response = self._get_response_body(driver, self.login_request_id)
-
-        # Handle login errors
-        if self.login_status_code != 200:
-            driver.quit()
-            error = self._handle_login_error(login_response)
-            raise error
-
-        self._set_account_name(account_monitor, login_response)
-
-    def _click_login_button(self, driver: webdriver.Chrome) -> None:
-        """
-        In some cases, the submit action on the login form may fail. Therefore, try clicking
-        again, if necessary.
-        """
-        self._wait_for_element_not_visible(driver, ".dimmer")
-        try:
-            popup = driver.find_element(By.CSS_SELECTOR, "div.popup")
-            if popup.is_displayed():
-                # Don't attempt to click the login button again if the submission form went through,
-                # yet there was an error
-                return
-        except NoSuchElementException:
-            pass
-
-        login_button = "button#login-btn"
-        try:
-            WebDriverWait(driver, 5).until(
-                EC.invisibility_of_element_located((By.CSS_SELECTOR, login_button))
-            )
-        except Exception:
-            logger.debug("Login form failed to submit. Clicking login button again")
-            driver.find_element(By.CSS_SELECTOR, login_button).click()
-
-    def _fetch_reservations(self, driver: webdriver.Chrome) -> List[JSON]:
-        """
-        Waits for the reservations request to go through and returns only reservations
-        that are flights.
-        """
-        self._wait_for_attribute("trips_request_id")
-        trips_response = self._get_response_body(driver, self.trips_request_id)
-        reservations = trips_response["upcomingTripsPage"]
-        return [reservation for reservation in reservations if reservation["tripType"] == "FLIGHT"]
-
-    def _get_response_body(self, driver: webdriver.Chrome, request_id: str) -> JSON:
-        response = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
-        return json.loads(response["body"])
-
-    def _handle_login_error(self, response: JSON) -> LoginError:
-        if response.get("code") == INVALID_CREDENTIALS_CODE:
-            logger.debug("Invalid credentials provided when attempting to log in")
-            reason = "Invalid credentials"
-        else:
-            logger.debug("Logging in failed for an unknown reason")
-            reason = "Unknown"
-
-        return LoginError(reason, self.login_status_code)
-
     def _get_needed_headers(self, request_headers: JSON) -> JSON:
+        """
+        Extracts the necessary headers from the request headers.
+        """
         headers = {}
         for header in request_headers:
             if re.match(r"x-api-key|x-channel-id|user-agent|^[\w-]+?-\w$", header, re.I):
@@ -369,22 +372,41 @@ class WebDriver:
 
         return headers
 
-    def _set_account_name(self, account_monitor: AccountMonitor, response: JSON) -> None:
-        if account_monitor.first_name:
-            # No need to set the name if this isn't the first time logging in
-            return
+    def _fetch_reservations(self, driver: webdriver.Chrome) -> List[JSON]:
+        """
+        Waits for the reservations request to go through and returns only reservations that are flights.
+        """
+        try:
+            # Allow time for network requests to complete
+            time.sleep(5)
 
-        logger.debug("First time logging in. Setting account name")
-        account_monitor.first_name = response["customers.userInformation.firstName"]
-        account_monitor.last_name = response["customers.userInformation.lastName"]
+            logs = driver.get_log("performance")
+            reservations = []
+            for entry in logs:
+                log = json.loads(entry["message"])["message"]
+                if log["method"] == "Network.responseReceived":
+                    response_url = log["params"]["response"]["url"]
+                    if response_url.startswith(TRIPS_URL):
+                        request_id = log["params"]["requestId"]
+                        logger.debug(f"Found response for TRIPS_URL: {response_url}")
 
-        print(
-            f"Successfully logged in to {account_monitor.first_name} "
-            f"{account_monitor.last_name}'s account\n"
-        )  # Don't log as it contains sensitive information
+                        # Get the response body
+                        response_body = driver.execute_cdp_cmd(
+                            "Network.getResponseBody", {"requestId": request_id}
+                        )
+                        response_content = response_body.get("body", "")
 
-    def _wait_for_element_not_visible(self, driver: webdriver.Chrome, css_selector: str) -> None:
-        """Waits until the element specified by the CSS selector is not visible."""
-        WebDriverWait(driver, WAIT_TIMEOUT_SECS).until(
-            EC.invisibility_of_element_located((By.CSS_SELECTOR, css_selector))
-        )
+                        # Parse the JSON response
+                        try:
+                            response_json = json.loads(response_content)
+                            upcoming_trips = response_json.get("upcomingTripsPage", [])
+                            reservations = [trip for trip in upcoming_trips if trip.get("tripType") == "FLIGHT"]
+                            logger.debug(f"Retrieved {len(reservations)} flight reservations.")
+                            break  # Exit after finding the reservations
+                        except json.JSONDecodeError as jde:
+                            logger.error(f"Failed to decode JSON from reservations response: {jde}")
+            return reservations
+        except Exception as e:
+            logger.error(f"Error while fetching reservations: {e}")
+            self._take_debug_screenshot(driver, "fetch_reservations_error.png")
+            raise
